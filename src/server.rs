@@ -490,6 +490,27 @@ pub struct KeyboardKeyInput {
     pub keys: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct InputBatchInput {
+    #[schemars(
+        description = "1 to 32 steps run in order, each {\"do\": move|click|drag|scroll|type|key|key_down|key_up|pause, ...} with the same arguments as the single-action tool. The batch stops at the first failing step."
+    )]
+    pub steps: Vec<crate::win32::input::BatchStep>,
+    #[schemars(
+        description = "window_ref from window_list. Before every step not marked unguarded, this window must be in the foreground, or the batch stops without sending that step. Use it so an unexpected dialog or notification does not receive the remaining input."
+    )]
+    pub guard_window_ref: Option<String>,
+    #[schemars(
+        description = "Milliseconds to wait after the last step before the capture, up to 5000 (default 0)."
+    )]
+    #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+    pub settle_ms: Option<u64>,
+    #[schemars(
+        description = "Optional screenshot taken after the steps, including when a step failed: {\"kind\": desktop|monitor|window|region, ...} as in desktop_snapshot. Omit for no image."
+    )]
+    pub capture: Option<crate::desktop::SnapshotTarget>,
+}
+
 // Performance
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PerfTopInput {
@@ -1769,6 +1790,83 @@ impl MasterControlProgram {
         interactive!(crate::win32::input::keyboard_key(&input.keys))
     }
 
+    #[tool(
+        description = "Run several pointer and keyboard steps in one call under a single input lock, for sequences whose outcome is predictable from one screenshot (click a field, type, tab, type, press enter). Returns a compact report of how many steps ran and, if one failed, which one and why; later steps are never sent after a failure and nothing is retried. key_down/key_up hold modifiers across steps (shift+click selection); held keys are always released when the batch ends. guard_window_ref stops the batch if another window takes the foreground. capture returns one screenshot after the steps. Coordinates are physical virtual-screen pixels, as in mouse_click."
+    )]
+    async fn input_batch(
+        &self,
+        Parameters(input): Parameters<InputBatchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let settle_ms = input.settle_ms.unwrap_or(0);
+        if settle_ms > crate::win32::input::MAX_PAUSE_MS {
+            return err(format!(
+                "settle_ms must be at most {}; no input was sent",
+                crate::win32::input::MAX_PAUSE_MS
+            ));
+        }
+        let guard = match input.guard_window_ref {
+            Some(window_ref) => {
+                let desktop = self.desktop.clone();
+                match crate::runtime::blocking(move || desktop.resolve_window(&window_ref)).await {
+                    Ok(window) => Some(crate::win32::input::BatchGuard {
+                        hwnd: window.identity.hwnd,
+                        pid: window.identity.pid,
+                    }),
+                    Err(error) => {
+                        return err(format!("guard_window_ref: {error:#}; no input was sent"))
+                    }
+                }
+            }
+            None => None,
+        };
+        let steps = input.steps;
+        let mut result = interactive!(crate::win32::input::input_batch(&steps, guard))?;
+        let Some(target) = input.capture else {
+            return Ok(result);
+        };
+        // The capture runs even after a failed step: seeing what took the
+        // foreground is the next thing the caller needs.
+        if settle_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+        }
+        let desktop = self.desktop.clone();
+        let snapshot = crate::runtime::blocking_with_timeout(10_000, move || {
+            desktop.snapshot(crate::desktop::SnapshotInput {
+                target: Some(target),
+                image: Some(true),
+                accessibility: Some(false),
+                ..Default::default()
+            })
+        })
+        .await;
+        match snapshot {
+            Ok(mut snapshot) => {
+                if let (Some(image), Some(capture)) = (snapshot.image.take(), &snapshot.capture) {
+                    result.content.push(Content::image(image, "image/jpeg"));
+                    result.content.push(Content::text(
+                        serde_json::json!({
+                            "Capture": {
+                                "SnapshotId": snapshot.snapshot_id,
+                                "OriginX": capture.origin_x, "OriginY": capture.origin_y,
+                                "Width": capture.width, "Height": capture.height,
+                                "ScaleX": capture.scale_x, "ScaleY": capture.scale_y,
+                            }
+                        })
+                        .to_string(),
+                    ));
+                } else {
+                    result
+                        .content
+                        .push(Content::text("Capture returned no image"));
+                }
+            }
+            Err(error) => result
+                .content
+                .push(Content::text(format!("Capture failed: {error:#}"))),
+        }
+        Ok(result)
+    }
+
     // ── Windows Update (2) ───────────────────────────────────────────────
 
     #[tool(
@@ -2410,6 +2508,7 @@ mod tests {
             "mouse_drag",
             "keyboard_type",
             "keyboard_key",
+            "input_batch",
         ] {
             assert!(
                 !src.contains(&format!("native!(crate::win32::input::{tool}")),

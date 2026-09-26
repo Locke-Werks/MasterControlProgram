@@ -2,6 +2,8 @@
 
 use super::pretty;
 use anyhow::{bail, Context, Result};
+use rmcp::schemars;
+use serde::Deserialize;
 use serde_json::json;
 use std::mem::size_of;
 use std::time::Duration;
@@ -110,6 +112,7 @@ trait InputSender {
     fn is_down(&mut self, vk: u16) -> bool;
     fn cursor(&mut self) -> Result<POINT>;
     fn geometry(&mut self) -> (i32, i32, i32, i32);
+    fn foreground(&mut self) -> Foreground;
     fn checkpoint(&mut self) -> Result<()> {
         crate::runtime::checkpoint()
     }
@@ -154,6 +157,37 @@ impl InputSender for WindowsInput {
             )
         }
     }
+
+    fn foreground(&mut self) -> Foreground {
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            // Cached caption only; GetWindowTextW does not send WM_GETTEXT
+            // across processes, so a hung target cannot stall the batch.
+            let mut buffer = [0u16; 256];
+            let length = GetWindowTextW(hwnd, &mut buffer).max(0) as usize;
+            Foreground {
+                hwnd: hwnd.0 as u64,
+                pid,
+                title: String::from_utf16_lossy(&buffer[..length]),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Foreground {
+    hwnd: u64,
+    pid: u32,
+    title: String,
+}
+
+/// The window every guarded batch step requires to be in the foreground.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BatchGuard {
+    pub hwnd: u64,
+    pub pid: u32,
 }
 
 struct InputOperation<'a, S: InputSender> {
@@ -274,6 +308,120 @@ impl<S: InputSender> InputOperation<'_, S> {
         }
         Ok(())
     }
+
+    fn owns_key(&self, vk: u16) -> bool {
+        self.held.contains(&HeldInput::Key(vk))
+    }
+
+    fn move_to(&mut self, x: i32, y: i32) -> Result<POINT> {
+        self.glide_to(x, y)?;
+        self.sender.cursor()
+    }
+
+    fn click(&mut self, position: Option<(i32, i32)>, button: Button, count: u32) -> Result<u32> {
+        self.require_unheld_button(button)?;
+        self.position_if_requested(position)?;
+        let click_count = count.clamp(1, 5);
+        let held = HeldInput::Mouse(button);
+        for _ in 0..click_count {
+            self.require_unheld_button(button)?;
+            self.send(&[Event::Down(held), Event::Up(held)])?;
+            if click_count > 1 {
+                self.sender.sleep(Duration::from_millis(30))?;
+            }
+        }
+        Ok(click_count)
+    }
+
+    fn scroll(&mut self, position: Option<(i32, i32)>, amount: i32) -> Result<()> {
+        self.position_if_requested(position)?;
+        self.send(&[Event::Plain(INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    mouseData: amount as u32,
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        })])
+    }
+
+    fn drag(&mut self, from: (i32, i32), to: (i32, i32), button: Button) -> Result<()> {
+        self.require_unheld_button(button)?;
+        self.glide_to(from.0, from.1)?;
+        self.sender.sleep(Duration::from_millis(15))?;
+        self.require_unheld_button(button)?;
+        let held = HeldInput::Mouse(button);
+        self.send(&[Event::Down(held)])?;
+        self.sender.sleep(Duration::from_millis(30))?;
+        self.glide_to(to.0, to.1)?;
+        self.sender.sleep(Duration::from_millis(15))?;
+        self.send(&[Event::Up(held)])
+    }
+
+    fn type_text(&mut self, text: &str) -> Result<()> {
+        for ch in text.encode_utf16() {
+            let held = HeldInput::Unicode(ch);
+            self.send(&[Event::Down(held), Event::Up(held)])?;
+        }
+        Ok(())
+    }
+
+    /// Presses and releases a chord. Keys already down, whether the user holds
+    /// them or an earlier batch step does, are left alone and reported back.
+    fn press(&mut self, mut vks: Vec<u16>) -> Result<Vec<u16>> {
+        let mut already_held = Vec::new();
+        vks.retain(|vk| {
+            if self.held.contains(&HeldInput::Key(*vk)) || self.sender.is_down(*vk) {
+                already_held.push(*vk);
+                false
+            } else {
+                true
+            }
+        });
+        if vks.is_empty() {
+            bail!("All requested keys are already held; no input was sent");
+        }
+        let events: Vec<_> = vks
+            .iter()
+            .map(|vk| Event::Down(HeldInput::Key(*vk)))
+            .chain(vks.iter().rev().map(|vk| Event::Up(HeldInput::Key(*vk))))
+            .collect();
+        self.send(&events)?;
+        Ok(already_held)
+    }
+
+    fn hold(&mut self, vks: &[u16]) -> Result<()> {
+        for vk in vks {
+            if self.owns_key(*vk) {
+                bail!("Key 0x{vk:02X} is already held by an earlier key_down in this batch");
+            }
+            if self.sender.is_down(*vk) {
+                bail!("Key 0x{vk:02X} is already held by the user; refusing to take ownership of it");
+            }
+        }
+        let events: Vec<_> = vks
+            .iter()
+            .map(|vk| Event::Down(HeldInput::Key(*vk)))
+            .collect();
+        self.send(&events)
+    }
+
+    fn release(&mut self, vks: &[u16]) -> Result<()> {
+        if let Some(vk) = vks.iter().find(|vk| !self.owns_key(**vk)) {
+            bail!("Key 0x{vk:02X} was not pressed by key_down in this batch; refusing to release it");
+        }
+        let events: Vec<_> = vks
+            .iter()
+            .rev()
+            .map(|vk| Event::Up(HeldInput::Key(*vk)))
+            .collect();
+        self.send(&events)
+    }
 }
 
 impl<S: InputSender> Drop for InputOperation<'_, S> {
@@ -353,8 +501,7 @@ pub fn mouse_move(x: i32, y: i32) -> Result<String> {
 
 fn move_with(sender: &mut impl InputSender, x: i32, y: i32) -> Result<String> {
     operate(sender, |operation| {
-        operation.glide_to(x, y)?;
-        let observed = operation.sender.cursor()?;
+        let observed = operation.move_to(x, y)?;
         Ok(pretty(&json!({
             "Status": "Moved", "X": x, "Y": y,
             "Accepted": true, "EventsSent": operation.accepted,
@@ -378,17 +525,7 @@ fn click_with(
     let position = paired_position(x, y)?;
     let selected = Button::from_name(button);
     operate(sender, |operation| {
-        operation.require_unheld_button(selected)?;
-        operation.position_if_requested(position)?;
-        let click_count = count.clamp(1, 5);
-        let held = HeldInput::Mouse(selected);
-        for _ in 0..click_count {
-            operation.require_unheld_button(selected)?;
-            operation.send(&[Event::Down(held), Event::Up(held)])?;
-            if click_count > 1 {
-                operation.sender.sleep(Duration::from_millis(30))?;
-            }
-        }
+        let click_count = operation.click(position, selected, count)?;
         let observed = operation.sender.cursor()?;
         Ok(pretty(&json!({
             "Status": "Clicked", "Button": button, "Count": click_count,
@@ -411,24 +548,9 @@ fn scroll_with(
     clicks: i32,
 ) -> Result<String> {
     let position = paired_position(x, y)?;
-    let amount = clicks
-        .checked_mul(120)
-        .context("Mouse wheel delta overflow; no input was sent")?;
+    let amount = wheel_delta(clicks)?;
     operate(sender, |operation| {
-        operation.position_if_requested(position)?;
-        operation.send(&[Event::Plain(INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: 0,
-                    dy: 0,
-                    mouseData: amount as u32,
-                    dwFlags: MOUSEEVENTF_WHEEL,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        })])?;
+        operation.scroll(position, amount)?;
         Ok(pretty(&json!({
             "Status": "Scrolled", "Clicks": clicks,
             "Direction": if clicks > 0 { "Up" } else { "Down" },
@@ -458,16 +580,7 @@ fn drag_with(
 ) -> Result<String> {
     let selected = Button::from_name(button);
     operate(sender, |operation| {
-        operation.require_unheld_button(selected)?;
-        operation.glide_to(start_x, start_y)?;
-        operation.sender.sleep(Duration::from_millis(15))?;
-        operation.require_unheld_button(selected)?;
-        let held = HeldInput::Mouse(selected);
-        operation.send(&[Event::Down(held)])?;
-        operation.sender.sleep(Duration::from_millis(30))?;
-        operation.glide_to(end_x, end_y)?;
-        operation.sender.sleep(Duration::from_millis(15))?;
-        operation.send(&[Event::Up(held)])?;
+        operation.drag((start_x, start_y), (end_x, end_y), selected)?;
         let observed = operation.sender.cursor()?;
         Ok(pretty(&json!({
             "Status": "Dragged", "Button": button,
@@ -487,10 +600,7 @@ fn type_with(sender: &mut impl InputSender, text: &str) -> Result<String> {
     let count = u32::try_from(text.encode_utf16().count())
         .context("Text is too long to count UTF-16 units")?;
     operate(sender, |operation| {
-        for ch in text.encode_utf16() {
-            let held = HeldInput::Unicode(ch);
-            operation.send(&[Event::Down(held), Event::Up(held)])?;
-        }
+        operation.type_text(text)?;
         Ok(pretty(&json!({
             "Status": "Typed", "Characters": count,
             "Accepted": true, "EventsSent": operation.accepted,
@@ -504,6 +614,275 @@ pub fn keyboard_key(keys: &str) -> Result<String> {
 }
 
 fn key_with(sender: &mut impl InputSender, keys: &str) -> Result<String> {
+    let vks = parse_keys(keys)?;
+    operate(sender, |operation| {
+        let already_held = operation.press(vks)?;
+        Ok(pretty(&json!({
+            "Status": "Pressed", "Keys": keys, "EventsSent": operation.accepted,
+            "Accepted": true, "Observed": { "AlreadyHeldVirtualKeys": already_held },
+            "ApplicationActionObserved": false,
+        })))
+    })
+}
+
+pub(crate) const MAX_BATCH_STEPS: usize = 32;
+pub(crate) const MAX_PAUSE_MS: u64 = 5_000;
+
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub(crate) enum BatchAction {
+    /// Glide the pointer to x, y.
+    Move {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        x: i32,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        y: i32,
+    },
+    /// Click at x, y, or at the current position when both are omitted.
+    Click {
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        x: Option<i32>,
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        y: Option<i32>,
+        #[schemars(description = "left, right or middle (default left)")]
+        button: Option<String>,
+        #[schemars(description = "1 to 5 (default 1)")]
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        count: Option<u32>,
+    },
+    Drag {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        start_x: i32,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        start_y: i32,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        end_x: i32,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        end_y: i32,
+        button: Option<String>,
+    },
+    /// Positive clicks scroll up, negative down.
+    Scroll {
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        x: Option<i32>,
+        #[serde(default, deserialize_with = "crate::coerce::opt_num")]
+        y: Option<i32>,
+        #[serde(deserialize_with = "crate::coerce::num")]
+        clicks: i32,
+    },
+    /// Literal text as Unicode key events.
+    Type { text: String },
+    /// Press and release a chord, same syntax as keyboard_key ("ctrl+s").
+    Key { keys: String },
+    /// Press keys and keep them down for later steps ("shift", "ctrl+alt").
+    /// Anything still held when the batch ends is released automatically.
+    KeyDown { keys: String },
+    /// Release keys held by an earlier key_down in this batch.
+    KeyUp { keys: String },
+    /// Wait, up to 5000 ms.
+    Pause {
+        #[serde(deserialize_with = "crate::coerce::num")]
+        ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct BatchStep {
+    #[serde(flatten)]
+    pub action: BatchAction,
+    #[schemars(
+        description = "Skip the foreground guard before this step, for a step that is expected to run while another window is in front."
+    )]
+    #[serde(default)]
+    pub unguarded: bool,
+}
+
+/// A step parsed and range-checked before any input is sent, so a typo in
+/// step 7 cannot fail after steps 0-6 have already reached an application.
+enum Prepared {
+    Move(i32, i32),
+    Click(Option<(i32, i32)>, Button, u32),
+    Drag((i32, i32), (i32, i32), Button),
+    Scroll(Option<(i32, i32)>, i32),
+    Type(String),
+    Key(Vec<u16>),
+    KeyDown(Vec<u16>),
+    KeyUp(Vec<u16>),
+    Pause(u64),
+}
+
+impl BatchAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Move { .. } => "move",
+            Self::Click { .. } => "click",
+            Self::Drag { .. } => "drag",
+            Self::Scroll { .. } => "scroll",
+            Self::Type { .. } => "type",
+            Self::Key { .. } => "key",
+            Self::KeyDown { .. } => "key_down",
+            Self::KeyUp { .. } => "key_up",
+            Self::Pause { .. } => "pause",
+        }
+    }
+
+    fn prepare(&self) -> Result<Prepared> {
+        Ok(match self {
+            Self::Move { x, y } => Prepared::Move(*x, *y),
+            Self::Click {
+                x,
+                y,
+                button,
+                count,
+            } => Prepared::Click(
+                paired_position(*x, *y)?,
+                Button::from_name(button.as_deref().unwrap_or("left")),
+                count.unwrap_or(1),
+            ),
+            Self::Drag {
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                button,
+            } => Prepared::Drag(
+                (*start_x, *start_y),
+                (*end_x, *end_y),
+                Button::from_name(button.as_deref().unwrap_or("left")),
+            ),
+            Self::Scroll { x, y, clicks } => {
+                Prepared::Scroll(paired_position(*x, *y)?, wheel_delta(*clicks)?)
+            }
+            Self::Type { text } => Prepared::Type(text.clone()),
+            Self::Key { keys } => Prepared::Key(parse_keys(keys)?),
+            Self::KeyDown { keys } => Prepared::KeyDown(parse_keys(keys)?),
+            Self::KeyUp { keys } => Prepared::KeyUp(parse_keys(keys)?),
+            Self::Pause { ms } => {
+                if *ms > MAX_PAUSE_MS {
+                    bail!("pause ms must be at most {MAX_PAUSE_MS}");
+                }
+                Prepared::Pause(*ms)
+            }
+        })
+    }
+}
+
+pub(crate) fn input_batch(steps: &[BatchStep], guard: Option<BatchGuard>) -> Result<String> {
+    batch_with(&mut WindowsInput, steps, guard)
+}
+
+/// Runs every step under one InputOperation, so a key_down in one step and
+/// the key_up in a later one share held-input ownership, and anything left
+/// down is released on success, failure, cancellation or unwinding alike.
+/// Returns Err carrying the same report when a step or cleanup fails, so the
+/// caller learns exactly which steps reached Windows.
+fn batch_with(
+    sender: &mut impl InputSender,
+    steps: &[BatchStep],
+    guard: Option<BatchGuard>,
+) -> Result<String> {
+    if !(1..=MAX_BATCH_STEPS).contains(&steps.len()) {
+        bail!("input_batch takes 1 to {MAX_BATCH_STEPS} steps; no input was sent");
+    }
+    let prepared = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            step.action.prepare().with_context(|| {
+                format!("step {index} ({}) is invalid; no input was sent", step.action.name())
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut operation = InputOperation {
+        sender,
+        held: Vec::new(),
+        accepted: 0,
+        requested: 0,
+        cleanup_attempted: false,
+    };
+    let mut completed = 0;
+    let mut failure = None;
+    let mut notes = Vec::new();
+    for (index, (step, action)) in steps.iter().zip(prepared).enumerate() {
+        let accepted_before = operation.accepted;
+        let result = (|| {
+            if let (Some(guard), false) = (guard, step.unguarded) {
+                let found = operation.sender.foreground();
+                if found.hwnd != guard.hwnd || found.pid != guard.pid {
+                    bail!(
+                        "foreground window changed: expected hwnd 0x{:X} (pid {}), found hwnd 0x{:X} (pid {}, \"{}\"); this step was not sent",
+                        guard.hwnd, guard.pid, found.hwnd, found.pid, found.title
+                    );
+                }
+            }
+            match action {
+                Prepared::Move(x, y) => operation.move_to(x, y).map(drop),
+                Prepared::Click(position, button, count) => {
+                    operation.click(position, button, count).map(drop)
+                }
+                Prepared::Drag(from, to, button) => operation.drag(from, to, button),
+                Prepared::Scroll(position, amount) => operation.scroll(position, amount),
+                Prepared::Type(text) => operation.type_text(&text),
+                Prepared::Key(vks) => {
+                    let already_held = operation.press(vks)?;
+                    if !already_held.is_empty() {
+                        notes.push(json!({"Step": index, "AlreadyHeldVirtualKeys": already_held}));
+                    }
+                    Ok(())
+                }
+                Prepared::KeyDown(vks) => operation.hold(&vks),
+                Prepared::KeyUp(vks) => operation.release(&vks),
+                Prepared::Pause(ms) => operation.sender.sleep(Duration::from_millis(ms)),
+            }
+        })();
+        match result {
+            Ok(()) => completed += 1,
+            Err(error) => {
+                // Nonzero means the failed step itself partly reached Windows,
+                // for example half of a typed string.
+                failure = Some(json!({
+                    "Step": index, "Do": step.action.name(), "Error": format!("{error:#}"),
+                    "EventsSentInStep": operation.accepted - accepted_before,
+                }));
+                break;
+            }
+        }
+    }
+    let cleanup = operation.release_owned().err().map(|error| format!("{error:#}"));
+    let cursor = operation
+        .sender
+        .cursor()
+        .ok()
+        .map(|point| json!({"X": point.x, "Y": point.y}));
+    let failed = failure.is_some() || cleanup.is_some();
+    let mut report = json!({
+        "Status": if failed { "Stopped" } else { "Completed" },
+        "Completed": completed,
+        "Total": steps.len(),
+        "EventsSent": operation.accepted,
+        "EventsRequested": operation.requested,
+        "Cursor": cursor,
+        "ApplicationActionObserved": false,
+    });
+    if let Some(failure) = failure {
+        report["Failed"] = failure;
+        report["NotRun"] = json!(steps.len() - completed - 1);
+    }
+    if let Some(cleanup) = cleanup {
+        report["CleanupError"] = json!(cleanup);
+    }
+    if !notes.is_empty() {
+        report["Notes"] = json!(notes);
+    }
+    let text = report.to_string();
+    if failed {
+        bail!(text);
+    }
+    Ok(text)
+}
+
+fn parse_keys(keys: &str) -> Result<Vec<u16>> {
     let mut vks = Vec::new();
     for part in keys.split('+').map(str::trim) {
         let vk = vk_from_name(part).with_context(|| format!("Unknown key name: '{part}'"))?;
@@ -511,31 +890,13 @@ fn key_with(sender: &mut impl InputSender, keys: &str) -> Result<String> {
             vks.push(vk);
         }
     }
-    operate(sender, |operation| {
-        let mut already_held = Vec::new();
-        vks.retain(|vk| {
-            if operation.sender.is_down(*vk) {
-                already_held.push(*vk);
-                false
-            } else {
-                true
-            }
-        });
-        if vks.is_empty() {
-            bail!("All requested keys are already held; no input was sent");
-        }
-        let events: Vec<_> = vks
-            .iter()
-            .map(|vk| Event::Down(HeldInput::Key(*vk)))
-            .chain(vks.iter().rev().map(|vk| Event::Up(HeldInput::Key(*vk))))
-            .collect();
-        operation.send(&events)?;
-        Ok(pretty(&json!({
-            "Status": "Pressed", "Keys": keys, "EventsSent": operation.accepted,
-            "Accepted": true, "Observed": { "AlreadyHeldVirtualKeys": already_held },
-            "ApplicationActionObserved": false,
-        })))
-    })
+    Ok(vks)
+}
+
+fn wheel_delta(clicks: i32) -> Result<i32> {
+    clicks
+        .checked_mul(120)
+        .context("Mouse wheel delta overflow; no input was sent")
 }
 
 fn vk_from_name(name: &str) -> Option<u16> {
@@ -691,6 +1052,9 @@ mod tests {
         sleeps: usize,
         user_hold_on_sleep: Option<u16>,
         fail_cursor_after_send: bool,
+        foreground: Foreground,
+        /// Switches the foreground after this many send batches.
+        steal_foreground_after: Option<usize>,
     }
 
     impl Default for FakeInput {
@@ -708,6 +1072,12 @@ mod tests {
                 sleeps: 0,
                 user_hold_on_sleep: None,
                 fail_cursor_after_send: false,
+                foreground: Foreground {
+                    hwnd: 0x100,
+                    pid: 42,
+                    title: "Target".into(),
+                },
+                steal_foreground_after: None,
             }
         }
     }
@@ -746,6 +1116,19 @@ mod tests {
         }
         fn geometry(&mut self) -> (i32, i32, i32, i32) {
             self.geometry
+        }
+        fn foreground(&mut self) -> Foreground {
+            if self
+                .steal_foreground_after
+                .is_some_and(|batches| self.batches.len() >= batches)
+            {
+                return Foreground {
+                    hwnd: 0x200,
+                    pid: 7,
+                    title: "Toast".into(),
+                };
+            }
+            self.foreground.clone()
         }
         fn checkpoint(&mut self) -> Result<()> {
             self.checks += 1;
@@ -1064,6 +1447,245 @@ mod tests {
             assert_eq!(result.is_ok(), prefix == 2);
             assert!(sender.held.is_empty());
         }
+    }
+
+    fn steps(value: serde_json::Value) -> Vec<BatchStep> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn report(error: anyhow::Error) -> serde_json::Value {
+        serde_json::from_str(&error.to_string()).unwrap()
+    }
+
+    const GUARD: BatchGuard = BatchGuard {
+        hwnd: 0x100,
+        pid: 42,
+    };
+
+    #[test]
+    fn batch_steps_deserialize_with_coercion_and_reject_unknown_actions() {
+        let parsed = steps(json!([
+            {"do": "click", "x": "10", "y": 5, "count": "2"},
+            {"do": "key_down", "keys": "shift", "unguarded": true},
+            {"do": "pause", "ms": "20"},
+        ]));
+        assert!(matches!(
+            parsed[0].action,
+            BatchAction::Click { x: Some(10), y: Some(5), count: Some(2), .. }
+        ));
+        assert!(parsed[1].unguarded && !parsed[0].unguarded);
+        assert!(matches!(parsed[2].action, BatchAction::Pause { ms: 20 }));
+        assert!(serde_json::from_value::<Vec<BatchStep>>(json!([{"do": "hover"}])).is_err());
+    }
+
+    #[test]
+    fn batch_runs_steps_in_order_under_one_operation() {
+        let mut sender = FakeInput::default();
+        let value: serde_json::Value = serde_json::from_str(
+            &batch_with(
+                &mut sender,
+                &steps(json!([
+                    {"do": "click"},
+                    {"do": "type", "text": "ab"},
+                    {"do": "key", "keys": "tab"},
+                    {"do": "scroll", "clicks": -1},
+                ])),
+                Some(GUARD),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let left = HeldInput::Mouse(Button::Left);
+        let tab = HeldInput::Key(VK_TAB.0);
+        assert_eq!(
+            sender.batches,
+            [
+                vec![SentEvent::Down(left), SentEvent::Up(left)],
+                vec![
+                    SentEvent::Down(HeldInput::Unicode(0x61)),
+                    SentEvent::Up(HeldInput::Unicode(0x61))
+                ],
+                vec![
+                    SentEvent::Down(HeldInput::Unicode(0x62)),
+                    SentEvent::Up(HeldInput::Unicode(0x62))
+                ],
+                vec![SentEvent::Down(tab), SentEvent::Up(tab)],
+                vec![SentEvent::Wheel(-120)],
+            ]
+        );
+        assert_eq!(value["Status"], "Completed");
+        assert_eq!(value["Completed"], 4);
+        assert_eq!(value["EventsSent"], 9);
+        assert!(value.get("Failed").is_none());
+    }
+
+    #[test]
+    fn modifier_held_across_steps_is_released_when_the_batch_ends() {
+        let shift = HeldInput::Key(VK_SHIFT.0);
+        let left = HeldInput::Mouse(Button::Left);
+        let mut sender = FakeInput::default();
+        batch_with(
+            &mut sender,
+            &steps(json!([
+                {"do": "key_down", "keys": "shift"},
+                {"do": "click"},
+                {"do": "key", "keys": "shift+down"},
+            ])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(sender.batches[0], [SentEvent::Down(shift)]);
+        assert_eq!(sender.batches[1], [SentEvent::Down(left), SentEvent::Up(left)]);
+        // Shift is owned by the batch, so the chord presses only the arrow.
+        assert_eq!(
+            sender.batches[2],
+            [
+                SentEvent::Down(HeldInput::Key(VK_DOWN.0)),
+                SentEvent::Up(HeldInput::Key(VK_DOWN.0))
+            ]
+        );
+        assert_eq!(sender.batches.last().unwrap(), &[SentEvent::Up(shift)]);
+        assert!(sender.held.is_empty());
+
+        let mut sender = FakeInput::default();
+        batch_with(
+            &mut sender,
+            &steps(json!([
+                {"do": "key_down", "keys": "ctrl+shift"},
+                {"do": "key_up", "keys": "ctrl+shift"},
+            ])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sender.batches[1],
+            [
+                SentEvent::Up(HeldInput::Key(VK_SHIFT.0)),
+                SentEvent::Up(HeldInput::Key(VK_CONTROL.0))
+            ]
+        );
+        assert_eq!(sender.batches.len(), 2);
+    }
+
+    #[test]
+    fn failed_step_stops_the_batch_and_releases_held_modifiers() {
+        let mut sender = FakeInput {
+            counts: [1, 2, 1].into(),
+            ..Default::default()
+        };
+        let value = report(
+            batch_with(
+                &mut sender,
+                &steps(json!([
+                    {"do": "key_down", "keys": "ctrl"},
+                    {"do": "click"},
+                    {"do": "click"},
+                    {"do": "type", "text": "never"},
+                ])),
+                None,
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(value["Status"], "Stopped");
+        assert_eq!(value["Completed"], 2);
+        assert_eq!(value["Failed"]["Step"], 2);
+        assert_eq!(value["Failed"]["Do"], "click");
+        assert_eq!(value["Failed"]["EventsSentInStep"], 1);
+        assert_eq!(value["NotRun"], 1);
+        assert!(value["Failed"]["Error"]
+            .as_str()
+            .unwrap()
+            .contains("accepted 1 of 2"));
+        assert!(sender.held.is_empty());
+        assert!(!sender
+            .batches
+            .iter()
+            .flatten()
+            .any(|event| matches!(event, SentEvent::Down(HeldInput::Unicode(_)))));
+    }
+
+    #[test]
+    fn guard_stops_before_sending_to_a_new_foreground_window() {
+        let mut sender = FakeInput {
+            steal_foreground_after: Some(1),
+            ..Default::default()
+        };
+        let value = report(
+            batch_with(
+                &mut sender,
+                &steps(json!([
+                    {"do": "type", "text": "a"},
+                    {"do": "type", "text": "b"},
+                    {"do": "type", "text": "c"},
+                ])),
+                Some(GUARD),
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(sender.batches.len(), 1);
+        assert_eq!(value["Completed"], 1);
+        assert_eq!(value["Failed"]["Step"], 1);
+        assert_eq!(value["Failed"]["EventsSentInStep"], 0);
+        let error = value["Failed"]["Error"].as_str().unwrap();
+        assert!(error.contains("foreground window changed") && error.contains("Toast"));
+
+        let mut sender = FakeInput {
+            steal_foreground_after: Some(1),
+            ..Default::default()
+        };
+        batch_with(
+            &mut sender,
+            &steps(json!([
+                {"do": "type", "text": "a"},
+                {"do": "type", "text": "b", "unguarded": true},
+            ])),
+            Some(GUARD),
+        )
+        .unwrap();
+        assert_eq!(sender.batches.len(), 2);
+    }
+
+    #[test]
+    fn invalid_batches_send_nothing() {
+        let too_many: Vec<_> = (0..=MAX_BATCH_STEPS)
+            .map(|_| json!({"do": "pause", "ms": 0}))
+            .collect();
+        for definition in [
+            json!([]),
+            json!(too_many),
+            json!([{"do": "type", "text": "a"}, {"do": "key", "keys": "ctrl+nope"}]),
+            json!([{"do": "type", "text": "a"}, {"do": "pause", "ms": MAX_PAUSE_MS + 1}]),
+            json!([{"do": "type", "text": "a"}, {"do": "click", "x": 1}]),
+            json!([{"do": "type", "text": "a"}, {"do": "scroll", "clicks": i32::MAX}]),
+        ] {
+            let mut sender = FakeInput::default();
+            assert!(batch_with(&mut sender, &steps(definition.clone()), None).is_err());
+            assert!(sender.batches.is_empty(), "{definition}");
+        }
+    }
+
+    #[test]
+    fn key_up_and_key_down_refuse_keys_the_batch_does_not_own() {
+        let mut sender = FakeInput::default();
+        let value = report(
+            batch_with(&mut sender, &steps(json!([{"do": "key_up", "keys": "shift"}])), None)
+                .unwrap_err(),
+        );
+        assert!(value["Failed"]["Error"]
+            .as_str()
+            .unwrap()
+            .contains("was not pressed by key_down"));
+        assert!(sender.batches.is_empty());
+
+        let mut sender = FakeInput {
+            user_held: vec![VK_CONTROL.0],
+            ..Default::default()
+        };
+        assert!(
+            batch_with(&mut sender, &steps(json!([{"do": "key_down", "keys": "ctrl"}])), None)
+                .is_err()
+        );
+        assert!(sender.batches.is_empty());
     }
 
     #[tokio::test]

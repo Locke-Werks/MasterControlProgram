@@ -493,6 +493,14 @@ impl Desktop {
         self.windows.list(&input, &operation)
     }
 
+    pub fn resolve_window(&self, window_ref: &str) -> Result<WindowRecord> {
+        require_session(None)?;
+        if window_ref.is_empty() || window_ref.len() > 128 {
+            bail!("Invalid window_ref");
+        }
+        self.windows.resolve(window_ref)
+    }
+
     pub fn window_manage(&self, input: WindowManageInput) -> Result<WindowActionResult> {
         require_session(input.session_id)?;
         let operation = self

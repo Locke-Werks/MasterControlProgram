@@ -2,7 +2,7 @@
 
 This guide covers the features added in v1.4.0, the debugger editing tools added
 in v1.5.0, and the binary analysis tools added in v1.6.0. The
-[README tool catalog](../README.md#tool-catalog) lists all 202 tools. MCP
+[README tool catalog](../README.md#tool-catalog) lists all 203 tools. MCP
 `tools/list` is the authority for input schemas, action enums and per-operation
 bounds.
 
@@ -67,6 +67,18 @@ Coordinates are physical desktop pixels. Input tools can affect whichever
 application receives Windows input; prefer exact UI/window references when
 possible. The activity overlay is notification, not consent. Passive reads do
 not pulse it.
+
+`input_batch` runs up to 32 pointer and keyboard steps in one call under a
+single input lock, for sequences whose outcome is predictable from one
+screenshot. Every step is validated before the first one is sent. The batch
+stops at the first failure and reports `Completed`, the failed step with
+`EventsSentInStep`, and `NotRun`; nothing is retried. `key_down` and `key_up`
+hold modifiers across steps, and any key still held when the batch ends, fails
+or is canceled is released. With `guard_window_ref`, each step that is not
+marked `unguarded` first requires that window to be in the foreground, so a
+dialog or notification that takes focus mid-batch stops the batch instead of
+receiving its input. `capture` takes one `desktop_snapshot`-style image after
+the steps, including after a failure.
 
 ## Terminals and jobs
 

@@ -16,7 +16,7 @@
 
 > *"End of line."*
 
-**202 tools in v1.6.2.** Native Windows administration, desktop observation and
+**203 tools in v1.6.2.** Native Windows administration, desktop observation and
 input, addressable terminals and jobs, event recording, deterministic workflows,
 and process diagnostics with guarded debugger editing and binary analysis.
 
@@ -175,7 +175,7 @@ retried blindly.
 
 ## Tool catalog
 
-All 202 registered tool names are listed below. Use the input schema returned by
+All 203 registered tool names are listed below. Use the input schema returned by
 your server for action enums, required identities, supported scopes and bounds.
 Numeric fields with coercion accept decimal strings, which avoids rounding large
 Windows identities in clients that cannot represent every 64-bit integer.
@@ -199,7 +199,7 @@ Windows identities in clients that cannot represent every 64-bit integer.
 | Commands and Windows features | `powershell_execute` `cmd_execute` `wmi_query` `feature_list` `feature_enable` `feature_disable` |
 | Clipboard, display and audio | `clipboard_get` `clipboard_set` `display_info` `audio_devices` `audio_volume` `audio_meter` `audio_sessions` `audio_session_volume` `audio_record` |
 | Performance and updates | `perf_snapshot` `perf_top` `perf_counter` `update_list` `update_history` |
-| Pointer and keyboard | `screen_capture` `cursor_position` `mouse_move` `mouse_click` `mouse_scroll` `mouse_drag` `keyboard_type` `keyboard_key` |
+| Pointer and keyboard | `screen_capture` `cursor_position` `mouse_move` `mouse_click` `mouse_scroll` `mouse_drag` `keyboard_type` `keyboard_key` `input_batch` |
 | Desktop observation and UI Automation | `desktop_snapshot` `desktop_ocr` `ui_find` `ui_invoke` `ui_set_value` `ui_text` `ui_wait` `desktop_cancel` `window_list` `window_find` `window_manage` |
 | Execution context and host | `execution_context` `host_shutdown` |
 | Terminals | `terminal_create` `terminal_input` `terminal_read` `terminal_resize` `terminal_interrupt` `terminal_close` `terminal_list` |
@@ -229,6 +229,7 @@ The computer use tools let an AI assistant **see and interact with your desktop*
 - **`mouse_drag`**: Glide to start point, hold button, glide to end point, release. Smooth eased interpolation throughout.
 - **`keyboard_type`**: Type arbitrary Unicode text (emoji, CJK, accented chars, whatever) via KEYEVENTF_UNICODE. Works regardless of keyboard layout, because we refuse to care about your layout.
 - **`keyboard_key`**: Press key combos: `ctrl+c`, `alt+tab`, `win+d`, `shift+f5`, `enter`, and friends. Handles modifier hold/release sequences automatically.
+- **`input_batch`**: Up to 32 of the above as one call under a single input lock, planned from one screenshot: click a field, type, tab, type, enter. `key_down`/`key_up` hold modifiers across steps for shift+click selection, and anything still held is released when the batch ends. An optional foreground guard stops the batch before an unexpected dialog can take the rest of the typing, and an optional capture returns one screenshot afterwards. Stops at the first failed step and reports exactly which steps reached Windows.
 
 All mouse movement uses **ease-in-out cubic interpolation**. The cursor accelerates from rest, cruises, then decelerates to a stop. Duration scales with distance (60ms for short hops, up to 600ms for cross-screen sweeps). No teleporting like some kind of cut-rate poltergeist. Watching the cursor glide on its own is either mesmerizing or deeply unsettling depending on your relationship with the machine.
 

@@ -665,6 +665,32 @@ fn native_startup_and_legacy_tools_do_not_require_powershell() {
         "missing pwsh must be a tool error"
     );
     assert_success(&client.tool("memory_info", json!({})));
+
+    let batch = tools
+        .iter()
+        .find(|tool| tool["name"] == "input_batch")
+        .expect("input_batch");
+    assert_eq!(batch["inputSchema"]["required"], json!(["steps"]));
+    // Each of these must be refused before a single event reaches the desktop.
+    for (arguments, expected) in [
+        (json!({"steps": []}), "1 to 32 steps"),
+        (
+            json!({"steps": [{"do": "key", "keys": "ctrl+nope"}]}),
+            "Unknown key name",
+        ),
+        (
+            json!({"steps": [{"do": "type", "text": "x"}], "guard_window_ref": "missing"}),
+            "guard_window_ref",
+        ),
+        (
+            json!({"steps": [{"do": "type", "text": "x"}], "settle_ms": 5001}),
+            "settle_ms",
+        ),
+    ] {
+        let result = client.tool("input_batch", arguments.clone());
+        assert_eq!(result["isError"], true, "{arguments}");
+        assert!(text(&result).contains(expected), "{arguments}: {}", text(&result));
+    }
 }
 
 #[test]
