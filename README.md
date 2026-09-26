@@ -14,6 +14,10 @@
 
 ---
 
+[![MasterControlProgram demo](https://img.youtube.com/vi/06oT62d-Uz0/maxresdefault.jpg)](https://www.youtube.com/watch?v=06oT62d-Uz0)
+
+*Demo: Claude drives your Windows PC over MCP (1:39)*
+
 > *"End of line."*
 
 **203 tools in v1.7.0.** Native Windows administration, desktop observation and
